@@ -1,3 +1,4 @@
+[![](https://img.shields.io/badge/NeurIPS-Pixelsmith-68448b)](https://proceedings.neurips.cc/paper_files/paper/2024/file/48644509339cb3076f7b0407c7588af6-Paper-Conference.pdf)
 [![](https://img.shields.io/badge/arXiv-Pixelsmith-red.svg)](https://arxiv.org/abs/2406.07251)
 [![](https://img.shields.io/badge/Project_Page-Pixelsmith-green.svg)](https://thanos-db.github.io/Pixelsmith/)
 
