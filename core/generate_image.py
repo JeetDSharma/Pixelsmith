@@ -1,154 +1,147 @@
-# core/generate_image.py
-# Step 1: Single-run image generation with metrics and zoomed crops
-# Compatible with RTX 2080 Ti on Unity HPC Cluster
-
-import os, sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import gc
-import time
-import uuid
-import torch
-import random
+import os, sys, time, uuid, gc, torch, argparse
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
-plt.rcParams["figure.dpi"] = 300
+plt.rcParams['figure.dpi'] = 300
 
-# import Pixelsmith wrapper (already defined in your repo)
+# --- path fix so imports work via sbatch ---
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pixelsmith_pipeline import generate_image as pixelsmith_generate
 
 
-def setup_device():
-    """Detect and prepare CUDA device."""
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA device not available")
-    torch.cuda.empty_cache()
-    gpu_name = torch.cuda.get_device_name(0)
-    return gpu_name
+def setup_dirs():
+    os.makedirs("results/images", exist_ok=True)
+    os.makedirs("results/zoomed", exist_ok=True)
+    os.makedirs("results/logs", exist_ok=True)
 
 
-def _make_dirs(base_dir="results"):
-    """Ensure result directories exist."""
-    os.makedirs(os.path.join(base_dir, "images"), exist_ok=True)
-    os.makedirs(os.path.join(base_dir, "zoomed"), exist_ok=True)
-    os.makedirs(os.path.join(base_dir, "logs"), exist_ok=True)
-    return base_dir
-
-
-def _save_zoom_crops(image, save_prefix, zoom_specs):
-    """Crop and save zoomed-in regions."""
-    arr = np.array(image)
-    h, w, _ = arr.shape
-    saved_paths = []
-
-    for name, (y_frac, x_frac, frac_h, frac_w) in zoom_specs.items():
-        y1 = int(h * y_frac)
-        y2 = int(y1 + h * frac_h)
-        x1 = int(w * x_frac)
-        x2 = int(x1 + w * frac_w)
-        crop = arr[y1:y2, x1:x2]
-        crop_img = Image.fromarray(crop)
-        path = f"{save_prefix}_zoom_{name}.png"
-        crop_img.save(path)
-        saved_paths.append(path)
-
-    return saved_paths
-
-
-def generate_with_metrics(
-    prompt,
-    negative_prompt,
-    h_res=1024,
-    w_res=1024,
-    slider=None,
-    guidance_scale=7.5,
-    image=None,
-    seed=None,
-    output_dir="results",
-    save_images=True,
-):
-    """
-    Run a single Pixelsmith generation and record metrics.
-    """
-    _make_dirs(output_dir)
-    gpu_name = setup_device()
-
-    if seed is None:
-        seed = random.randint(0, 2**32 - 1)
-
-    run_id = str(uuid.uuid4())[:8]
-    base_name = f"{output_dir}/images/run_{run_id}"
-
-    # Start timing and clear memory
+def measure_gpu_memory():
+    torch.cuda.synchronize()
+    mem = torch.cuda.max_memory_allocated() / 1e9
     torch.cuda.reset_peak_memory_stats()
-    start = time.time()
+    return round(mem, 3)
 
-    im = pixelsmith_generate(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        h_res=h_res,
-        w_res=w_res,
-        image=image,
-        slider=slider,
-        guidance_scale=guidance_scale,
-        seed=seed,
-    )
 
-    runtime = round(time.time() - start, 2)
-    max_mem_gb = round(torch.cuda.max_memory_allocated() / 1e9, 3)
+def save_zoom(image, zoom_factor, region, label, run_id):
+    y1, y2, x1, x2 = region
+    arr = np.array(image)
+    zoomed = arr[y1 * zoom_factor:y2 * zoom_factor, x1 * zoom_factor:x2 * zoom_factor]
+    zoom_path = f"results/zoomed/{run_id}_{label}_{zoom_factor}x.png"
+    Image.fromarray(zoomed).save(zoom_path)
+    return zoom_path
 
-    # Save main image
-    image_path = None
-    if save_images:
-        image_path = f"{base_name}.png"
-        im.save(image_path)
 
-        # Define zoom crops (fractions of image)
-        zoom_specs = {
-            "center": (0.45, 0.45, 0.1, 0.1),
-            "top_left": (0.05, 0.05, 0.08, 0.08),
-            "random": (
-                random.uniform(0.2, 0.7),
-                random.uniform(0.2, 0.7),
-                0.08,
-                0.08,
-            ),
-        }
-        _save_zoom_crops(im, base_name, zoom_specs)
+def generate_progressive(prompt, negative_prompt, h_res, w_res, guidance_scale, max_scale, seed):
+    start_total = time.time()
+    run_id = uuid.uuid4().hex[:8]
+    stage_metrics = []
 
-    gc.collect()
-    torch.cuda.empty_cache()
+    # fixed zoom regions
+    zoom_region_1 = (90, 290, 450, 600)
+    zoom_region_2 = (180, 210, 520, 550)
 
-    metrics = {
-        "run_id": run_id,
-        "prompt": prompt,
-        "resolution": f"{h_res}x{w_res}",
-        "slider": slider,
-        "guidance_scale": guidance_scale,
-        "runtime_sec": runtime,
-        "gpu_memory_gb": max_mem_gb,
-        "gpu_name": gpu_name,
-        "seed": seed,
-        "image_path": image_path,
+    print(f"Run ID: {run_id}")
+    print(f"Prompt: {prompt}")
+    print(f"Max scale: {max_scale}x")
+
+    # define slider progression pattern
+    slider_map = {
+        1: None,   # base generation
+        2: 22,
+        4: 34,
+        8: 42,
+        16: 48
     }
 
-    return im, metrics
+    image = None
+    current_scale = 1
+
+    while current_scale <= max_scale:
+        stage_start = time.time()
+        scaled_h = int(h_res * current_scale)
+        scaled_w = int(w_res * current_scale)
+        slider = slider_map.get(current_scale, 48)
+
+        print(f"\n--- Generating {current_scale}x ({scaled_h}x{scaled_w}) ---")
+        print(f"Slider: {slider}, Guidance: {guidance_scale}")
+
+        img = pixelsmith_generate(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            h_res=scaled_h,
+            w_res=scaled_w,
+            image=image,
+            slider=slider,
+            guidance_scale=guidance_scale,
+            seed=seed,
+        )
+
+        runtime = round(time.time() - stage_start, 2)
+        mem = measure_gpu_memory()
+
+        out_path = f"results/images/run_{run_id}_{current_scale}x.png"
+        img.save(out_path)
+
+        # zoom crops
+        z1 = save_zoom(img, current_scale, zoom_region_1, "zoomA", run_id)
+        z2 = save_zoom(img, current_scale, zoom_region_2, "zoomB", run_id)
+
+        stage_metrics.append({
+            "run_id": run_id,
+            "scale": f"{current_scale}x",
+            "resolution": f"{scaled_h}x{scaled_w}",
+            "slider": slider,
+            "guidance_scale": guidance_scale,
+            "runtime_sec": runtime,
+            "gpu_memory_gb": mem,
+            "image_path": out_path,
+            "zoomA": z1,
+            "zoomB": z2,
+        })
+
+        # prepare next iteration
+        image = img
+        current_scale *= 2
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    total_runtime = round(time.time() - start_total, 2)
+    print(f"\nRun complete. Total runtime: {total_runtime} s")
+
+    # log metrics per run
+    log_path = f"results/logs/metrics_{run_id}.txt"
+    with open(log_path, "w") as f:
+        for s in stage_metrics:
+            f.write(str(s) + "\n")
+
+    print(f"Metrics saved to {log_path}")
+    return stage_metrics
 
 
 if __name__ == "__main__":
-    # Minimal test run (safe for cluster)
-    prompt = "a detailed futuristic cityscape at sunset, ultra realistic lighting"
-    negative_prompt = "low quality, blurry, distorted, text artifacts"
-    image, metrics = generate_with_metrics(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        h_res=1024,
-        w_res=1024,
-        guidance_scale=7.5,
-        slider=None,
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--prompt", type=str,
+                        default="a detailed futuristic cityscape at sunset, ultra realistic lighting")
+    parser.add_argument("--negative_prompt", type=str,
+                        default="low quality, blurry, distorted, text artifacts")
+    parser.add_argument("--h_res", type=int, default=1024)
+    parser.add_argument("--w_res", type=int, default=1024)
+    parser.add_argument("--guidance_scale", type=float, default=7.5)
+    parser.add_argument("--max_scale", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=None)
+    args = parser.parse_args()
+
+    setup_dirs()
+    metrics = generate_progressive(
+        prompt=args.prompt,
+        negative_prompt=args.negative_prompt,
+        h_res=args.h_res,
+        w_res=args.w_res,
+        guidance_scale=args.guidance_scale,
+        max_scale=args.max_scale,
+        seed=args.seed,
     )
 
-    print("Run complete. Metrics:")
-    for k, v in metrics.items():
-        print(f"{k}: {v}")
+    print("\nFinal Metrics Summary:")
+    for m in metrics:
+        print(m)
