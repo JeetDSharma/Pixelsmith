@@ -1,3 +1,4 @@
 __pycache__/
 core/logs/
 core/results/
+core/results_arch/
