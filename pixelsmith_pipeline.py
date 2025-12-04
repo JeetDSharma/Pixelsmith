@@ -1231,6 +1231,7 @@ class Pixelsmith(
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         image = None,
         slider = None,
+        patch_size: int = 128,
         **kwargs,
     ):
         r"""
@@ -1721,7 +1722,7 @@ class Pixelsmith(
  
             b,c,latent_size_h,latent_size_w=latents.shape
             times=torch.ones((1,1,latent_size_h,latent_size_w)).int().to(self.device)*timesteps.max().item()
-            patch_size = 128
+            # patch_size is now a parameter (default 128)
             p=patch_size//2
             
 
@@ -2013,6 +2014,7 @@ def generate_image(prompt,
                    guidance_scale=7.5,
                    pag_scale=0,
                    seed=None,
+                   patch_size=128,
                    ):
     
     if seed == None:
@@ -2048,6 +2050,7 @@ def generate_image(prompt,
                 pag_scale=pag_scale,
                 height = h_res,
                 width = w_res,
+                patch_size=patch_size,
                 ).images[0]
 
     plt.figure()
