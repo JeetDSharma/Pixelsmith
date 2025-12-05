@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Single-run memory measurement for ablation study.
-Generates at a specific resolution and reports detailed VRAM metrics.
+Cascaded memory measurement for Pixelsmith ablation study.
+Implements the proper two-step framework: Base (1024) -> 2K -> 4K
 
 Usage:
-    python measure_memory.py --resolution 2048 --patch_size 128
+    python measure_memory.py --patch_size 128
+    python measure_memory.py --patch_size 256
 """
 
-import os, sys, time, gc, torch, argparse, json, threading
+import os, sys, time, gc, torch, argparse, json, threading, traceback
 import numpy as np
 from PIL import Image
 from datetime import datetime
@@ -100,30 +101,38 @@ class MemoryTracer:
         return self.trace
 
 
-def run_measurement(resolution, patch_size, seed, prompt, negative_prompt, guidance_scale):
-    """Run a single generation and measure memory."""
+def run_single_step(step_name, input_image, target_resolution, patch_size, seed, 
+                    prompt, negative_prompt, guidance_scale, slider):
+    """
+    Run a single refinement step and measure memory.
     
+    Args:
+        step_name: Label for this step (e.g., "base", "2k", "4k")
+        input_image: PIL Image from previous step (None for base generation)
+        target_resolution: Target resolution for this step
+        patch_size: Patch size for denoising
+        ... other generation params
+    
+    Returns:
+        (output_image, results_dict)
+    """
     print(f"\n{'='*60}")
-    print(f"MEMORY MEASUREMENT")
-    print(f"Resolution: {resolution}x{resolution}")
+    print(f"STEP: {step_name.upper()}")
+    print(f"Input: {'None (text-to-image)' if input_image is None else f'{input_image.size[0]}x{input_image.size[1]}'}")
+    print(f"Target: {target_resolution}x{target_resolution}")
     print(f"Patch Size: {patch_size}")
-    print(f"Seed: {seed}")
+    print(f"Slider: {slider}")
     print(f"{'='*60}")
     
-    # Get GPU info for reproducibility
-    gpu_info = get_gpu_info()
-    print(f"GPU: {gpu_info.get('gpu_name', 'N/A')} ({gpu_info.get('gpu_total_vram_mb', 0):.0f} MB)")
-    
-    # Clear GPU before measurement
+    # Clear GPU and reset stats before this step
     clear_gpu()
     baseline = get_memory_stats()
     print(f"Baseline memory: {baseline.get('current_allocated_mb', 0):.1f} MB")
     
-    # Start memory tracer for sawtooth plot
-    tracer = MemoryTracer(interval=0.5)
+    # Start memory tracer
+    tracer = MemoryTracer(interval=0.25)
     tracer.start()
     
-    # Run generation
     timestamp = datetime.now().isoformat()
     start_time = time.time()
     
@@ -131,10 +140,10 @@ def run_measurement(resolution, patch_size, seed, prompt, negative_prompt, guida
         img = pixelsmith_generate(
             prompt=prompt,
             negative_prompt=negative_prompt,
-            h_res=resolution,
-            w_res=resolution,
-            image=None,  # Direct generation (no upscaling)
-            slider=None,
+            h_res=target_resolution,
+            w_res=target_resolution,
+            image=input_image,  # None for base, PIL Image for refinement
+            slider=slider,
             guidance_scale=guidance_scale,
             seed=seed,
             patch_size=patch_size,
@@ -153,96 +162,182 @@ def run_measurement(resolution, patch_size, seed, prompt, negative_prompt, guida
         runtime = time.time() - start_time
         status = "FAILED"
         img = None
-        print(f"[ERROR] {e}")
+        print(f"[ERROR] {type(e).__name__}: {e}")
+        print("[TRACEBACK]")
+        traceback.print_exc()
+        print("[/TRACEBACK]")
     
-    # Stop memory tracer and get trace
+    # Stop tracer and get memory stats
     memory_trace = tracer.stop()
-    
-    # Get final memory stats
     final_stats = get_memory_stats()
     
-    # Compile results
-    # Independent variables (inputs): resolution, patch_size
-    # Dependent variables (measured): peak_vram_mb, alloc_count, runtime_sec
-    # Derived (for H2 regression): n_patches = (resolution / patch_size)^2
+    # Compile step results
     results = {
-        # Metadata
+        "step": step_name,
         "timestamp": timestamp,
-        # GPU environment (reproducibility)
-        **gpu_info,
-        # Independent variables
-        "resolution": resolution,
+        "input_resolution": input_image.size[0] if input_image else 0,
+        "target_resolution": target_resolution,
         "patch_size": patch_size,
+        "slider": slider,
         "seed": seed,
-        # Dependent variables (measured)
         "status": status,
         "runtime_sec": round(runtime, 2),
         "peak_vram_mb": final_stats.get("peak_allocated_mb", 0),
         "peak_reserved_mb": final_stats.get("peak_reserved_mb", 0),
-        "alloc_count": final_stats.get("alloc_count", 0),  # N_alloc - total malloc calls
+        "alloc_count": final_stats.get("alloc_count", 0),
         "alloc_count_large": final_stats.get("alloc_count_large", 0),
         "alloc_count_small": final_stats.get("alloc_count_small", 0),
-        # Derived (for H2 analysis)
-        "n_patches": (resolution // patch_size) ** 2 if patch_size > 0 else 0,
-        # Memory trace for sawtooth plots
+        # Patch size is in latent space; SDXL VAE has 8x downsampling
+        "latent_resolution": target_resolution // 8,
+        "n_patches": ((target_resolution // 8) // patch_size) ** 2 if patch_size > 0 else 0,
         "memory_trace": memory_trace,
     }
     
-    # Print results
-    print(f"\n{'='*60}")
-    print("RESULTS")
-    print(f"{'='*60}")
-    print(f"Status: {status}")
-    print(f"Runtime: {runtime:.2f} sec")
-    print(f"Peak VRAM Allocated: {results['peak_vram_mb']:.2f} MB")
-    print(f"Peak VRAM Reserved: {results['peak_reserved_mb']:.2f} MB")
-    print(f"Allocation Count (N_alloc): {results['alloc_count']}")
-    print(f"  - Large pool: {results['alloc_count_large']}")
-    print(f"  - Small pool: {results['alloc_count_small']}")
-    print(f"N_patches (derived): {results['n_patches']}")
-    print(f"{'='*60}")
+    # Print step results
+    print(f"\nStep '{step_name}' complete:")
+    print(f"  Status: {status}")
+    print(f"  Runtime: {runtime:.2f} sec")
+    print(f"  Peak VRAM: {results['peak_vram_mb']:.2f} MB")
+    print(f"  N_patches: {results['n_patches']}")
     
-    # Output JSON for parsing
-    print(f"\n[JSON_RESULTS]{json.dumps(results)}[/JSON_RESULTS]")
+    return img, results
+
+
+def run_cascade(patch_size, seed, prompt, negative_prompt, guidance_scale):
+    """
+    Run the full Pixelsmith cascade: Base (1024) -> 2K -> 4K
+    Measures memory independently for each step.
+    """
+    print(f"\n{'#'*60}")
+    print(f"PIXELSMITH CASCADE MEASUREMENT")
+    print(f"Patch Size: {patch_size}")
+    print(f"Seed: {seed}")
+    print(f"Pipeline: 1024 -> 2048 -> 4096")
+    print(f"{'#'*60}")
     
-    # Save image if successful (use project root for consistency)
-    if img is not None:
+    # Slider progression map (matches generate_image.py)
+    slider_map = {
+        1024: None,  # base generation
+        2048: 22,
+        4096: 34,
+    }
+    
+    # Get GPU info
+    gpu_info = get_gpu_info()
+    print(f"GPU: {gpu_info.get('gpu_name', 'N/A')} ({gpu_info.get('gpu_total_vram_mb', 0):.0f} MB)")
+    
+    all_results = {
+        "cascade_id": datetime.now().strftime("%Y%m%d_%H%M%S"),
+        "patch_size": patch_size,
+        "seed": seed,
+        **gpu_info,
+        "steps": [],
+    }
+    
+    # Step 1: Base generation at 1024x1024
+    base_img, base_results = run_single_step(
+        step_name="base_1024",
+        input_image=None,  # Text-to-image
+        target_resolution=1024,
+        patch_size=patch_size,
+        seed=seed,
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        guidance_scale=guidance_scale,
+        slider=slider_map[1024],
+    )
+    all_results["steps"].append(base_results)
+    
+    if base_img is None:
+        print("\n[ABORT] Base generation failed, cannot continue cascade.")
+        print(f"\n[JSON_RESULTS]{json.dumps(all_results)}[/JSON_RESULTS]")
+        return all_results
+    
+    # Step 2: Refine to 2048x2048
+    img_2k, results_2k = run_single_step(
+        step_name="refine_2048",
+        input_image=base_img,
+        target_resolution=2048,
+        patch_size=patch_size,
+        seed=seed,
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        guidance_scale=guidance_scale,
+        slider=slider_map[2048],
+    )
+    all_results["steps"].append(results_2k)
+    
+    if img_2k is None:
+        print("\n[ABORT] 2K refinement failed, cannot continue cascade.")
+        print(f"\n[JSON_RESULTS]{json.dumps(all_results)}[/JSON_RESULTS]")
+        return all_results
+    
+    # Step 3: Refine to 4096x4096
+    img_4k, results_4k = run_single_step(
+        step_name="refine_4096",
+        input_image=img_2k,
+        target_resolution=4096,
+        patch_size=patch_size,
+        seed=seed,
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        guidance_scale=guidance_scale,
+        slider=slider_map[4096],
+    )
+    all_results["steps"].append(results_4k)
+    
+    # Summary
+    print(f"\n{'#'*60}")
+    print("CASCADE SUMMARY")
+    print(f"{'#'*60}")
+    total_runtime = sum(s["runtime_sec"] for s in all_results["steps"])
+    max_vram = max(s["peak_vram_mb"] for s in all_results["steps"])
+    print(f"Total Runtime: {total_runtime:.2f} sec")
+    print(f"Max Peak VRAM (across steps): {max_vram:.2f} MB")
+    for step in all_results["steps"]:
+        print(f"  {step['step']}: {step['status']} | {step['runtime_sec']:.1f}s | {step['peak_vram_mb']:.1f} MB | N={step['n_patches']}")
+    
+    all_results["total_runtime_sec"] = round(total_runtime, 2)
+    all_results["max_peak_vram_mb"] = max_vram
+    
+    # Save final image
+    if img_4k is not None:
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         output_dir = os.path.join(project_root, "results", "ablation")
         zoomed_dir = os.path.join(project_root, "results", "zoomed")
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(zoomed_dir, exist_ok=True)
         
-        # Save full image
-        img_path = os.path.join(output_dir, f"measure_R{resolution}_P{patch_size}_S{seed}.png")
-        img.save(img_path)
-        print(f"Image saved: {img_path}")
+        # Save full 4K image
+        img_path = os.path.join(output_dir, f"cascade_P{patch_size}_S{seed}_4096.png")
+        img_4k.save(img_path)
+        print(f"\n4K image saved: {img_path}")
         
-        # Save center crop (512x512) for detail comparison
+        # Save center crop for detail comparison
         crop_size = 512
-        cx, cy = img.width // 2, img.height // 2
-        crop = img.crop((cx - crop_size//2, cy - crop_size//2, 
-                         cx + crop_size//2, cy + crop_size//2))
-        crop_path = os.path.join(zoomed_dir, f"zoom_R{resolution}_P{patch_size}_S{seed}.png")
+        cx, cy = img_4k.width // 2, img_4k.height // 2
+        crop = img_4k.crop((cx - crop_size//2, cy - crop_size//2,
+                            cx + crop_size//2, cy + crop_size//2))
+        crop_path = os.path.join(zoomed_dir, f"cascade_P{patch_size}_S{seed}_crop.png")
         crop.save(crop_path)
         print(f"Zoomed crop saved: {crop_path}")
         
-        # Record file sizes (quality/complexity proxy)
-        results["image_file_size_kb"] = round(os.path.getsize(img_path) / 1024, 2)
-        results["crop_file_size_kb"] = round(os.path.getsize(crop_path) / 1024, 2)
+        all_results["image_file_size_kb"] = round(os.path.getsize(img_path) / 1024, 2)
+        all_results["crop_file_size_kb"] = round(os.path.getsize(crop_path) / 1024, 2)
+    
+    # Output JSON for parsing
+    print(f"\n[JSON_RESULTS]{json.dumps(all_results)}[/JSON_RESULTS]")
     
     # Cleanup
     clear_gpu()
     
-    return results
+    return all_results
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Single-run memory measurement")
-    parser.add_argument("--resolution", type=int, required=True,
-                        help="Target resolution (e.g., 1024, 2048, 4096, 8192)")
-    parser.add_argument("--patch_size", type=int, default=128,
-                        help="Patch size for denoising")
+    parser = argparse.ArgumentParser(description="Cascaded Pixelsmith memory measurement")
+    parser.add_argument("--patch_size", type=int, required=True,
+                        help="Patch size for denoising (e.g., 64, 128, 256)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     parser.add_argument("--prompt", type=str, 
@@ -252,8 +347,7 @@ if __name__ == "__main__":
     parser.add_argument("--guidance_scale", type=float, default=7.5)
     args = parser.parse_args()
     
-    results = run_measurement(
-        resolution=args.resolution,
+    results = run_cascade(
         patch_size=args.patch_size,
         seed=args.seed,
         prompt=args.prompt,
